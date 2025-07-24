@@ -1,0 +1,11 @@
+[project]
+name = "website-spider"
+version = "0.1.0"
+description = "网页渲染后的源码获取工具"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "loguru>=0.7.3",
+    "playwright>=1.54.0",
+]
