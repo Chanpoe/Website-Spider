@@ -26,14 +26,14 @@
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 克隆项目
-git clone https://github.com/yourusername/website-spider.git
-cd website-spider
+git clone https://github.com/Chanpoe/Website-Spider.git
+cd Website-Spider
 
 # 安装依赖
 uv install
 
-# 安装 Playwright 浏览器
-uv run playwright install chromium
+# 安装 Playwright
+uv run playwright install
 ```
 
 ### 使用示例
