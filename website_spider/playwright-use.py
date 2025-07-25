@@ -323,49 +323,80 @@ def get_html_source(url, headless=True) -> str:
                     browser.close()
                     raise e
 
-    def _try_with_different_strategies(target_url):
+    def _try_with_different_strategies(target_url, preferred_headless):
         """尝试不同的获取策略"""
-        # 策略1: 默认UA (Windows Chrome) - 先headless=True，失败后headless=False
-        try:
-            logger.info("策略1: 使用默认UA (Windows Chrome) - headless=True")
-            result = _get_html_with_browser(target_url, use_headless=True)
-            if result and len(result.strip()) > 100:
-                logger.info("策略1成功获取到内容")
-                return result
-        except Exception as e:
-            logger.warning(f"策略1 headless=True失败: {e}")
+        
+        if preferred_headless:
+            # 如果优先使用无头模式，先尝试无头，失败后尝试有头
+            # 策略1: 默认UA (Windows Chrome) - 无头模式
+            try:
+                logger.info("策略1: 使用默认UA (Windows Chrome) - headless=True")
+                result = _get_html_with_browser(target_url, use_headless=True)
+                if result and len(result.strip()) > 100:
+                    logger.info("策略1成功获取到内容")
+                    return result
+            except Exception as e:
+                logger.warning(f"策略1 headless=True失败: {e}")
+                
+            # 策略2: 手机UA - 无头模式
+            try:
+                logger.info("策略2: 使用手机UA模式 - headless=True")
+                result = _get_html_with_browser(target_url, use_headless=True, is_mobile=True)
+                if result and len(result.strip()) > 100:
+                    logger.info("策略2成功获取到内容")
+                    return result
+            except Exception as e:
+                logger.warning(f"策略2 headless=True失败: {e}")
+                
+            # 如果无头模式都失败，再尝试有头模式
+            logger.info("无头模式失败，尝试有头模式...")
+            
+            # 策略3: 默认UA (Windows Chrome) - 有头模式
+            try:
+                logger.info("策略3: 使用默认UA (Windows Chrome) - headless=False")
+                result = _get_html_with_browser(target_url, use_headless=False)
+                if result and len(result.strip()) > 100:
+                    logger.info("策略3成功获取到内容")
+                    return result
+            except Exception as e:
+                logger.warning(f"策略3 headless=False失败: {e}")
+                
+            # 策略4: 手机UA - 有头模式
+            try:
+                logger.info("策略4: 使用手机UA模式 - headless=False")
+                result = _get_html_with_browser(target_url, use_headless=False, is_mobile=True)
+                if result and len(result.strip()) > 100:
+                    logger.info("策略4成功获取到内容")
+                    return result
+            except Exception as e:
+                logger.warning(f"策略4 headless=False失败: {e}")
+        else:
+            # 如果不使用无头模式，仅使用有头模式
+            # 策略1: 默认UA (Windows Chrome) - 有头模式
             try:
                 logger.info("策略1: 使用默认UA (Windows Chrome) - headless=False")
                 result = _get_html_with_browser(target_url, use_headless=False)
                 if result and len(result.strip()) > 100:
                     logger.info("策略1成功获取到内容")
                     return result
-            except Exception as e2:
-                logger.warning(f"策略1 headless=False也失败: {e2}")
-
-        # 策略2: 手机UA - 先headless=True，失败后headless=False
-        try:
-            logger.info("策略2: 使用手机UA模式 - headless=True")
-            result = _get_html_with_browser(target_url, use_headless=True, is_mobile=True)
-            if result and len(result.strip()) > 100:
-                logger.info("策略2成功获取到内容")
-                return result
-        except Exception as e:
-            logger.warning(f"策略2 headless=True失败: {e}")
+            except Exception as e:
+                logger.warning(f"策略1 headless=False失败: {e}")
+                
+            # 策略2: 手机UA - 有头模式
             try:
                 logger.info("策略2: 使用手机UA模式 - headless=False")
                 result = _get_html_with_browser(target_url, use_headless=False, is_mobile=True)
                 if result and len(result.strip()) > 100:
                     logger.info("策略2成功获取到内容")
                     return result
-            except Exception as e2:
-                logger.warning(f"策略2 headless=False也失败: {e2}")
+            except Exception as e:
+                logger.warning(f"策略2 headless=False失败: {e}")
 
         return ""
 
     # 直接使用原始URL，不进行https/http切换
-    logger.info(f"尝试获取: {url}")
-    result = _try_with_different_strategies(url)
+    logger.info(f"尝试获取: {url}, headless模式: {headless}")
+    result = _try_with_different_strategies(url, headless)
     if result:
         return result
 
