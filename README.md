@@ -10,7 +10,7 @@
 
 - 🚀 **高性能抓取** - 基于 Playwright 的现代化网页抓取
 - 🛡️ **强反检测** - 内置多层反检测机制，专门针对政府网站等严格反爬场景
-- 🔄 **智能重试** - 多策略自动重试，支持无头/有头模式自动切换
+- 🔄 **智能重试** - 多策略自动重试，支持无头/有头模式智能切换
 - 📱 **多设备支持** - 支持桌面端和移动端 User-Agent 模拟
 - 🎯 **高成功率** - 针对复杂网站优化的加载策略
 - ⚡ **简单易用** - 一行代码即可获取完整渲染后的HTML源码
@@ -36,42 +36,24 @@ uv install
 uv run playwright install chromium
 ```
 
-### 基础使用
+### 使用示例
 
 ```python
 from website_spider.playwright_use import get_html_source
 
-# 获取网页源码
+# 基础用法 - 使用默认设置（优先无头模式，失败时自动切换有头模式）
 url = "https://example.com"
 html_content = get_html_source(url)
 
 if html_content:
+    print(html_content)
     print(f"成功获取HTML，长度: {len(html_content)}")
-    # 处理你的HTML内容
 else:
     print("获取失败")
+
+# 强制使用有头模式（适用于调试或特殊需求）
+html_content = get_html_source(url, headless=False)
 ```
-
-## 📚 详细用法
-
-### 基本参数
-
-```python
-# 优先使用无头模式（默认）
-html = get_html_source("https://example.com", headless=True)
-
-# 优先使用有头模式
-html = get_html_source("https://example.com", headless=False)
-```
-
-### 高级特性
-
-该工具内置了多种智能策略：
-
-1. **自动模式切换** - 无头模式失败时自动切换到有头模式
-2. **多User-Agent策略** - 自动尝试桌面端和移动端 User-Agent
-3. **智能等待** - 根据页面加载情况动态调整等待时间
-4. **反检测机制** - 内置多层反检测脚本，绕过常见的爬虫检测
 
 ### 支持的复杂场景
 
@@ -139,14 +121,19 @@ website-spider/
 
 ## 📋 待办事项
 
-- [ ] Selenium 实现支持
-- [ ] 代理支持
-- [ ] 并发抓取
-- [ ] 结果缓存
-- [ ] 配置文件支持
-- [ ] CLI工具
-- [ ] Docker支持
-- [ ] 更多浏览器支持
+- [ ] **核心功能增强**
+  - [ ] Selenium 实现支持
+  - [ ] 代理支持
+  - [ ] 并发抓取支持
+  - [ ] 结果缓存机制
+- [ ] **易用性提升**
+  - [ ] CLI工具
+  - [ ] 配置文件支持
+  - [ ] 更详细的日志输出
+- [ ] **部署和扩展**
+  - [ ] Docker支持
+  - [ ] 更多浏览器支持（Firefox、Safari）
+  - [ ] 分布式抓取支持
 
 ## 🤝 贡献
 
