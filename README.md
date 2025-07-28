@@ -151,19 +151,6 @@ website-spider/
 
 本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
 
-## 🙏 致谢
-
-- [Playwright](https://playwright.dev/) - 强大的浏览器自动化框架
-- [uv](https://github.com/astral-sh/uv) - 快速的Python包管理器
-- [Loguru](https://github.com/Delgan/loguru) - 优雅的日志库
-
-## 📞 联系方式
-
-如果你有任何问题或建议，请通过以下方式联系：
-
-- 提交 [Issue](https://github.com/yourusername/website-spider/issues)
-- 发送邮件至 [your.email@example.com](mailto:your.email@example.com)
-
 ---
 
 ⭐ 如果这个项目对你有帮助，请给它一个 Star！
