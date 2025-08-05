@@ -1,4 +1,11 @@
+import json
+import os
+import random
+import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 from loguru import logger
@@ -55,11 +62,15 @@ def get_html_source(url, headless=True) -> str:
                 "--disable-background-upload"
             ]
 
-            # 针对政府网站，使用更真实的浏览器配置
-            browser = p.chromium.launch(
+            # 创建临时用户数据目录
+            temp_user_data_dir = tempfile.mkdtemp(prefix='playwright_')
+            browser = p.chromium.launch_persistent_context(
                 headless=use_headless,
+                user_data_dir=temp_user_data_dir,
                 args=common_browser_args,
-                ignore_default_args=['--enable-automation']  # 禁用自动化标志
+                ignore_default_args=['--enable-automation'],  # 禁用自动化标志
+                ignore_https_errors=True,  # 忽略HTTPS错误
+                bypass_csp=True,  # 绕过内容安全策略
             )
 
             # 默认UA配置
@@ -102,129 +113,9 @@ def get_html_source(url, headless=True) -> str:
             if is_mobile:
                 context_config['viewport'] = {'width': 375, 'height': 667}
 
-            context = browser.new_context(**context_config)
+            # context = browser.new_context(**context_config)
 
-            # 更全面的反检测脚本
-            context.add_init_script("""
-                // 基础反检测
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
-                Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-                Object.defineProperty(navigator, 'connection', { get: () => ({ downlink: 10, effectiveType: '4g', rtt: 50 }) });
-
-                // 更真实的 navigator 对象
-                Object.defineProperty(navigator, 'mimeTypes', {
-                    get: () => ({
-                        length: 5,
-                        0: { type: 'application/pdf', description: 'Portable Document Format' },
-                        1: { type: 'application/x-google-chrome-pdf', description: 'Portable Document Format' },
-                        2: { type: 'application/x-nacl', description: 'Native Client Executable' },
-                        3: { type: 'application/x-shockwave-flash', description: 'Shockwave Flash' },
-                        4: { type: 'application/futuresplash', description: 'FutureSplash Player' }
-                    })
-                });
-
-                // 模拟真实的 screen 对象
-                Object.defineProperty(window, 'screen', {
-                    get: () => ({
-                        width: 1920,
-                        height: 1080,
-                        availWidth: 1920,
-                        availHeight: 1040,
-                        colorDepth: 24,
-                        pixelDepth: 24,
-                        orientation: { type: 'landscape-primary', angle: 0 }
-                    })
-                });
-
-                // 模拟真实的 window 对象
-                Object.defineProperty(window, 'outerWidth', { get: () => 1920 });
-                Object.defineProperty(window, 'outerHeight', { get: () => 1040 });
-                Object.defineProperty(window, 'innerWidth', { get: () => 1920 });
-                Object.defineProperty(window, 'innerHeight', { get: () => 937 });
-
-                // 禁用 WebGL 指纹检测
-                const getParameter = WebGLRenderingContext.prototype.getParameter;
-                WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                    if (parameter === 37445) return 'Intel Inc.';
-                    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-                    if (parameter === 37447) return 'Intel Iris OpenGL Engine';
-                    return getParameter.call(this, parameter);
-                };
-
-                // 模拟真实的 Canvas 指纹
-                const originalGetContext = HTMLCanvasElement.prototype.getContext;
-                HTMLCanvasElement.prototype.getContext = function(type, attributes) {
-                    const context = originalGetContext.call(this, type, attributes);
-                    if (type === '2d') {
-                        const originalFillText = context.fillText;
-                        context.fillText = function(text, x, y, maxWidth) {
-                            return originalFillText.call(this, text, x, y, maxWidth);
-                        };
-                    }
-                    return context;
-                };
-
-                // 模拟真实的 AudioContext
-                if (window.AudioContext || window.webkitAudioContext) {
-                    const AudioContext = window.AudioContext || window.webkitAudioContext;
-                    const originalGetChannelData = AudioContext.prototype.getChannelData;
-                    AudioContext.prototype.getChannelData = function(channel) {
-                        const data = originalGetChannelData.call(this, channel);
-                        // 添加微小的随机变化
-                        for (let i = 0; i < data.length; i += 100) {
-                            data[i] += Math.random() * 0.0001;
-                        }
-                        return data;
-                    };
-                }
-
-                // 模拟真实的 Battery API
-                if (navigator.getBattery) {
-                    const originalGetBattery = navigator.getBattery;
-                    navigator.getBattery = function() {
-                        return Promise.resolve({
-                            charging: true,
-                            chargingTime: Infinity,
-                            dischargingTime: Infinity,
-                            level: 0.85
-                        });
-                    };
-                }
-
-                // 模拟真实的 Permissions API
-                if (navigator.permissions) {
-                    const originalQuery = navigator.permissions.query;
-                    navigator.permissions.query = function(permissionDesc) {
-                        return Promise.resolve({ state: 'granted' });
-                    };
-                }
-
-                // 禁用各种检测
-                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-
-                // 模拟真实的 Chrome 运行时
-                if (window.chrome && window.chrome.runtime) {
-                    Object.defineProperty(window.chrome.runtime, 'onConnect', { get: () => undefined });
-                    Object.defineProperty(window.chrome.runtime, 'onMessage', { get: () => undefined });
-                }
-
-                // 模拟真实的 Performance API
-                if (window.performance && window.performance.getEntriesByType) {
-                    const originalGetEntriesByType = window.performance.getEntriesByType;
-                    window.performance.getEntriesByType = function(entryType) {
-                        const entries = originalGetEntriesByType.call(this, entryType);
-                        // 添加一些随机性
-                        return entries.map(entry => ({
-                            ...entry,
-                            duration: entry.duration + Math.random() * 0.1
-                        }));
-                    };
-                }
-            """)
+            context = browser
 
             page = context.new_page()
             if not is_mobile:
@@ -233,7 +124,6 @@ def get_html_source(url, headless=True) -> str:
             # 设置更高效的等待策略
             try:
                 # 添加随机延迟
-                import random
                 time.sleep(random.uniform(1, 3))
 
                 # 首先尝试10秒内加载domcontentloaded
@@ -248,6 +138,12 @@ def get_html_source(url, headless=True) -> str:
                         if len(current_html.strip()) > 100:
                             logger.info(f"domcontentloaded超时但页面有内容，直接返回: {len(current_html)} 字符")
                             browser.close()
+                            # 清理临时用户数据目录
+                            try:
+                                import shutil
+                                shutil.rmtree(temp_user_data_dir, ignore_errors=True)
+                            except:
+                                pass
                             return current_html
                     except Exception as content_error:
                         logger.warning(f"获取当前页面内容失败: {content_error}")
@@ -298,6 +194,12 @@ def get_html_source(url, headless=True) -> str:
                                                           retry_count + 1)
 
                 browser.close()
+                # 清理临时用户数据目录
+                try:
+                    import shutil
+                    shutil.rmtree(temp_user_data_dir, ignore_errors=True)
+                except:
+                    pass
                 return html
 
             except Exception as e:
@@ -312,6 +214,12 @@ def get_html_source(url, headless=True) -> str:
                         if len(current_html.strip()) > 100:
                             logger.info(f"超时但页面有内容，返回当前内容: {len(current_html)} 字符")
                             browser.close()
+                            # 清理临时用户数据目录
+                            try:
+                                import shutil
+                                shutil.rmtree(temp_user_data_dir, ignore_errors=True)
+                            except:
+                                pass
                             return current_html
                     except Exception as content_error:
                         logger.warning(f"获取当前页面内容失败: {content_error}")
@@ -321,6 +229,12 @@ def get_html_source(url, headless=True) -> str:
                     return _get_html_with_browser(target_url, use_headless, user_agent, is_mobile, retry_count + 1)
                 else:
                     browser.close()
+                    # 清理临时用户数据目录
+                    try:
+                        import shutil
+                        shutil.rmtree(temp_user_data_dir, ignore_errors=True)
+                    except:
+                        pass
                     raise e
 
     def _try_with_different_strategies(target_url, preferred_headless):
