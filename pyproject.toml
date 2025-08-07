@@ -9,5 +9,6 @@ dependencies = [
     "loguru>=0.7.3",
     "playwright>=1.54.0",
     "selenium>=4.34.2",
+    "setuptools>=80.9.0",
     "undetected-chromedriver>=3.5.5",
 ]
