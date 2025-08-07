@@ -3,12 +3,10 @@ import time
 import os
 import random
 from queue import Queue
-import pandas as pd
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict, Tuple, Union, Literal
 
-from pandas import DataFrame
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
