@@ -37,36 +37,64 @@ class MultitabWebSpider:
         options = uc.ChromeOptions()
         
         if self.headless:
-            # 使用新版 headless，指纹更自然
-            options.add_argument("--headless=new")
+            # 使用旧版 headless，并配合必要的稳定参数（与之前验证通过策略一致）
+            options.add_argument("--headless")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
         
-        # 自然化、尽量最少参数
-        basic_args = [
+        # 更“保险”的通用参数集合（与之前通过的策略对齐）
+        common_args = [
+            "--disable-web-security",
+            "--allow-running-insecure-content",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-features=TranslateUI",
+            "--disable-ipc-flooding-protection",
+            "--disable-default-apps",
+            "--disable-sync",
+            "--disable-translate",
+            "--hide-scrollbars",
+            "--mute-audio",
+            "--no-first-run",
+            "--safebrowsing-disable-auto-update",
+            "--disable-client-side-phishing-detection",
+            "--disable-component-update",
+            "--disable-domain-reliability",
+            "--disable-features=VizDisplayCompositor",
+            "--disable-hang-monitor",
+            "--disable-prompt-on-repost",
+            "--disable-background-networking",
+            "--disable-background-downloads",
+            "--disable-background-upload",
             "--window-size=1920,1080",
+            "--start-maximized",
         ]
-        for arg in basic_args:
+        for arg in common_args:
             options.add_argument(arg)
         
-        # 语言与区域，贴近真实用户
-        options.add_argument("--lang=zh-CN,zh;q=0.9,en;q=0.8")
+        #（保留语言设置无伤大雅）
         try:
+            options.add_argument("--lang=zh-CN,zh;q=0.9,en;q=0.8")
             options.add_experimental_option("prefs", {"intl.accept_languages": "zh-CN,zh"})
         except Exception:
             pass
 
         # 降低自动化可观测性（此环境对 excludeSwitches/useAutomationExtension 不兼容，跳过）
 
-        # 使用持久化用户目录，减少“新装浏览器”指纹
-        try:
-            profile_dir = os.path.join(os.path.expanduser("~"), ".uc_chrome_profile")
-            options.add_argument(f"--user-data-dir={profile_dir}")
-        except Exception:
-            pass
+        # 不使用持久化用户目录（保持与之前策略一致）
 
         # 设置页面加载策略为 eager（也可用 normal，按需）
         options.page_load_strategy = 'eager'
 
-        # 不主动开启 performance 日志，减少可疑信号；状态码改用 JS fetch 兜底
+        # 启用 performance 日志，便于从网络事件中提取状态码（避免使用 JS fetch 触发风控）
+        try:
+            options.add_argument("--enable-logging")
+            options.add_argument("--log-level=0")
+            options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+        except Exception:
+            pass
 
         # 解决 UC 下载驱动时在部分 macOS 环境下的证书校验错误
         try:
@@ -77,7 +105,39 @@ class MultitabWebSpider:
 
         # 可选：接受不安全证书（保持默认，不强行声明）
 
-        driver = uc.Chrome(options=options, use_subprocess=True, driver_executable_path=None, enable_cdp_events=False)
+        driver = uc.Chrome(
+            options=options,
+            use_subprocess=True,
+            driver_executable_path=None,
+            enable_cdp_events=True,
+        )
+
+        # 尝试开启 Network 域，确保可以接收到 response 事件
+        try:
+            driver.execute_cdp_cmd('Network.enable', {})
+        except Exception:
+            pass
+
+        # 注入额外的 navigator 伪装，贴合之前通过的策略
+        try:
+            driver.execute_script(
+                """
+                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
+                Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+                Object.defineProperty(navigator, 'mimeTypes', {
+                    get: () => ({
+                        length: 5,
+                        0: { type: 'application/pdf', description: 'Portable Document Format' },
+                        1: { type: 'application/x-google-chrome-pdf', description: 'Portable Document Format' },
+                        2: { type: 'application/x-nacl', description: 'Native Client Executable' },
+                        3: { type: 'application/x-shockwave-flash', description: 'Shockwave Flash' },
+                        4: { type: 'application/futuresplash', description: 'FutureSplash Player' }
+                    })
+                });
+                """
+            )
+        except Exception:
+            pass
 
         # 不强行开启 CDP 网络域
 
@@ -161,8 +221,8 @@ class MultitabWebSpider:
                 logger.warning(f"关闭浏览器时出错: {e}")
     
     def _get_status_code(self, url: str) -> int:
-        """尽量从 performance 日志或 JS fetch 获取状态码。"""
-        # 方式1: 从 performance 日志读取 Network.responseReceived
+        """从 performance 日志获取状态码，避免使用 JS fetch 触发风控。"""
+        # 优先：从 performance 日志读取 Network.responseReceived
         try:
             logs = self.driver.get_log('performance')
             for entry in logs:
@@ -180,18 +240,7 @@ class MultitabWebSpider:
         except Exception:
             pass
 
-        # 方式2: 使用 JS fetch 兜底
-        try:
-            status_code = self.driver.execute_script(
-                "return new Promise((resolve)=>{fetch(arguments[0]).then(r=>resolve(r.status)).catch(()=>resolve(0));});",
-                url,
-            )
-            if status_code and int(status_code) != 0:
-                return int(status_code)
-        except Exception:
-            pass
-
-        # 方式3: 简单就绪判断推断 200（不可靠，仅兜底）
+        # 兜底：简单就绪判断推断 200（不可靠，仅兜底）
         try:
             if self.driver.find_elements(By.TAG_NAME, 'body') and len(self.driver.page_source) > 100:
                 return 200
@@ -531,7 +580,7 @@ if __name__ == '__main__':
     # # 单站验证：chinattl
     # test_url = "http://www.chinattl.com/"
     # print("开始单站验证: ", test_url)
-
+    #
     # # 使用简化接口但限制为单标签（等效单站）
     # results = get_html_sources(
     #     [test_url],
@@ -540,13 +589,14 @@ if __name__ == '__main__':
     #     timeout=30,
     #     save_to_file=None,
     # )
-
+    #
     # r = results[0] if results else {}
     # content_len = r.get('content_length', 0)
     # status = r.get('status')
     # print(f"结果: 状态={status}, 内容长度={content_len}")
     # if status != 'success':
     #     print("失败详情:", r)
+    # exit()
 
     # 读取URL列表
     try:
