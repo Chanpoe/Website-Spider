@@ -46,8 +46,9 @@ async def _create_persistent_context_async(
     viewport: dict = None
 ):
     """创建 Patchright 持久化浏览器上下文（异步版）。返回 (context, temp_dir)。"""
-
-    temp_dir = tempfile.mkdtemp(prefix="patchright_profile_")
+    # 使用固定的持久化目录，提升一致性与通过率
+    persistent_dir = os.path.join(os.path.expanduser("~"), ".patchright_profile")
+    os.makedirs(persistent_dir, exist_ok=True)
 
     if viewport:
         viewport_size = viewport
@@ -69,53 +70,13 @@ async def _create_persistent_context_async(
         ua = None
 
     context_options = {
-        'user_data_dir': temp_dir,
+        'user_data_dir': persistent_dir,
         'headless': headless,
         'viewport': viewport_size,
         'locale': 'zh-CN',
         'timezone_id': 'Asia/Shanghai',
-        'permissions': ['geolocation'],
-        'geolocation': {'latitude': 39.9042, 'longitude': 116.4074},
-        'extra_http_headers': {
-            'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Cache-Control': 'max-age=0',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-User': '?1',
-            'Sec-Fetch-Dest': 'document',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Ch-Ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-            'Sec-Ch-Ua-Mobile': '?0',
-            'Sec-Ch-Ua-Platform': '"macOS"',
-            'Connection': 'keep-alive'
-        },
+        # 尽量减少可疑启动参数，仅保留窗口大小
         'args': [
-            "--disable-web-security",
-            "--allow-running-insecure-content",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--disable-features=TranslateUI",
-            "--disable-ipc-flooding-protection",
-            "--disable-default-apps",
-            "--disable-sync",
-            "--disable-translate",
-            "--hide-scrollbars",
-            "--mute-audio",
-            "--no-first-run",
-            "--safebrowsing-disable-auto-update",
-            "--disable-client-side-phishing-detection",
-            "--disable-component-update",
-            "--disable-domain-reliability",
-            "--disable-features=VizDisplayCompositor",
-            "--disable-hang-monitor",
-            "--disable-prompt-on-repost",
-            "--disable-background-networking",
-            "--disable-background-downloads",
-            "--disable-background-upload",
-            # 根据视口动态设置窗口尺寸
             f"--window-size={viewport_size['width']},{viewport_size['height']}",
         ],
     }
@@ -128,51 +89,22 @@ async def _create_persistent_context_async(
         context_options['is_mobile'] = True
         context_options['has_touch'] = True
 
-    context = await playwright.chromium.launch_persistent_context(**context_options)
+    # 优先使用系统 Chrome 渠道，失败则回退到默认
+    try:
+        context = await playwright.chromium.launch_persistent_context(channel='chrome', **context_options)
+    except Exception:
+        context = await playwright.chromium.launch_persistent_context(**context_options)
 
     await context.add_init_script(
         """
-        Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
-        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-        Object.defineProperty(navigator, 'mimeTypes', {
-          get: () => ({
-            length: 5,
-            0: { type: 'application/pdf', description: 'Portable Document Format' },
-            1: { type: 'application/x-google-chrome-pdf', description: 'Portable Document Format' },
-            2: { type: 'application/x-nacl', description: 'Native Client Executable' },
-            3: { type: 'application/x-shockwave-flash', description: 'Shockwave Flash' },
-            4: { type: 'application/futuresplash', description: 'FutureSplash Player' }
-          })
-        });
-        delete Object.getPrototypeOf(navigator).webdriver;
-        if (navigator.permissions) {
-          const originalQuery = navigator.permissions.query;
-          navigator.permissions.query = function (parameters) {
-            return originalQuery(parameters).then(result => {
-              if (parameters.name === 'notifications') result.state = 'prompt';
-              return result;
-            });
-          };
-        }
-        Object.defineProperty(navigator, 'doNotTrack', { get: () => null, configurable: true });
-        Object.defineProperty(navigator, 'connection', {
-          get: () => ({ effectiveType: '4g', downlink: 10, rtt: 50, saveData: false }),
-          configurable: true
-        });
-        Object.defineProperty(screen, 'colorDepth', { get: () => 24, configurable: true });
-        Object.defineProperty(screen, 'pixelDepth', { get: () => 24, configurable: true });
-        const originalFetch = window.fetch;
-        window.fetch = function (...args) {
-          if (args.length > 1 && args[1] && args[1].headers) {
-            if (!args[1].headers['User-Agent']) args[1].headers['User-Agent'] = navigator.userAgent;
-            if (!args[1].headers['Referer']) args[1].headers['Referer'] = window.location.href;
-          }
-          return originalFetch.apply(this, args);
-        };
+        try { delete Object.getPrototypeOf(navigator).webdriver; } catch (e) {}
+        try { Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] }); } catch (e) {}
+        try { Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' }); } catch (e) {}
         """
     )
 
-    return context, temp_dir
+    # 返回持久化目录为 None，避免调用方误删
+    return context, None
 
 
 def _get_status_code_from_response(response) -> int:
