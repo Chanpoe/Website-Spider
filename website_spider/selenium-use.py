@@ -1,668 +1,577 @@
 import json
 import time
-import os
 import random
-from queue import Queue
 import threading
+from queue import Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional, Dict, Tuple, Union, Literal
+from typing import List, Dict, Tuple, Union
 from contextlib import contextmanager
 
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
 from loguru import logger
 
 
-class WebDriverManager:
-    """
-    WebDriver 上下文管理器，确保 undetected_chromedriver 资源正确管理
-    """
-    def __init__(self, headless: bool = True, user_agent: str = None, 
-                 is_mobile: bool = False, enable_cdp: bool = False):
-        self.headless = headless
-        self.user_agent = user_agent
-        self.is_mobile = is_mobile
-        self.enable_cdp = enable_cdp
-        self.driver = None
+class MultitabWebSpider:
+    """单浏览器多标签页并发访问网站的爬虫类"""
     
+    def __init__(self, headless: bool = True, timeout: int = 30):
+        """
+        初始化爬虫
+        
+        :param headless: 是否使用无头模式
+        :param timeout: 页面加载超时时间
+        """
+        self.headless = headless
+        self.timeout = timeout
+        self.driver = None
+        self._lock = threading.Lock()
+    
+    def _create_driver(self) -> uc.Chrome:
+        """创建Chrome WebDriver实例"""
+        options = uc.ChromeOptions()
+        
+        if self.headless:
+            options.add_argument("--headless")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+        
+        # 基础优化配置
+        basic_args = [
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-web-security",
+            "--ignore-certificate-errors",
+            "--allow-insecure-localhost",
+            "--allow-running-insecure-content",
+            "--window-size=1920,1080",
+            "--start-maximized",
+        ]
+        for arg in basic_args:
+            options.add_argument(arg)
+        
+        # 设置页面加载策略为eager，加快加载速度
+        options.page_load_strategy = 'eager'
+
+        # 开启 performance 日志，后续用于提取 HTTP 状态码
+        try:
+            options.add_argument("--enable-logging")
+            options.add_argument("--log-level=0")
+            options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+        except Exception:
+            pass
+
+        # 解决 UC 下载驱动时在部分 macOS 环境下的证书校验错误
+        try:
+            import ssl  # noqa: WPS433
+            ssl._create_default_https_context = ssl._create_unverified_context  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        # 接受不安全证书
+        try:
+            options.set_capability('acceptInsecureCerts', True)
+        except Exception:
+            pass
+
+        driver = uc.Chrome(options=options, use_subprocess=True, driver_executable_path=None, enable_cdp_events=True)
+
+        # 尝试开启 CDP 网络域
+        try:
+            driver.execute_cdp_cmd('Network.enable', {})
+        except Exception:
+            pass
+
+        return driver
+    
+    def _try_bypass_ssl_interstitial(self, fast: bool = False) -> None:
+        """尝试绕过 Chrome SSL 隐私拦截页。
+        fast=True 使用无等待的快速探测，避免阻塞事件循环。
+        """
+        def _click_if(selector: str) -> bool:
+            try:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if elems:
+                    try:
+                        elems[0].click()
+                        return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return False
+
+        try:
+            if fast:
+                # 快速模式：无等待直接探测点击
+                # 1) 展开“高级”
+                if _click_if('#details-button') or _click_if('#advancedButton'):
+                    time.sleep(0.1)
+                # 2) 继续前往（忽略风险）
+                if _click_if('#proceed-link') or _click_if('button#primary-button'):
+                    return
+                # 3) 兜底：输入 thisisunsafe
+                try:
+                    ActionChains(self.driver).send_keys('thisisunsafe').perform()
+                except Exception:
+                    pass
+                return
+            else:
+                # 正常模式：带短等待
+                try:
+                    btn = WebDriverWait(self.driver, 2).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, '#details-button, #advancedButton'))
+                    )
+                    btn.click()
+                except Exception:
+                    pass
+                try:
+                    go = WebDriverWait(self.driver, 2).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, '#proceed-link, button#primary-button'))
+                    )
+                    go.click()
+                    return
+                except Exception:
+                    pass
+                try:
+                    ActionChains(self.driver).send_keys('thisisunsafe').perform()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def __enter__(self):
-        """进入上下文时创建WebDriver实例"""
-        self.driver = _create_driver(
-            self.headless, 
-            self.user_agent, 
-            self.is_mobile, 
-            self.enable_cdp
-        )
-        return self.driver
+        """进入上下文管理器"""
+        self.driver = self._create_driver()
+        try:
+            # 限制脚本执行时间，避免单次 execute_script 长时间阻塞事件循环
+            self.driver.set_script_timeout(3)
+            # 页加载超时（对 driver.get 生效，对 JS 导航不一定生效，但保留）
+            self.driver.set_page_load_timeout(self.timeout)
+        except Exception:
+            pass
+        return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """退出上下文时确保WebDriver被正确关闭"""
+        """退出上下文管理器"""
         if self.driver:
             try:
                 self.driver.quit()
-                logger.debug("WebDriver 已成功关闭")
+                logger.info("浏览器已关闭")
             except Exception as e:
-                logger.warning(f"关闭 WebDriver 时出现异常: {e}")
-            finally:
-                self.driver = None
+                logger.warning(f"关闭浏览器时出错: {e}")
+    
+    def _get_status_code(self, url: str) -> int:
+        """尽量从 performance 日志或 JS fetch 获取状态码。"""
+        # 方式1: 从 performance 日志读取 Network.responseReceived
+        try:
+            logs = self.driver.get_log('performance')
+            for entry in logs:
+                try:
+                    msg = json.loads(entry['message'])
+                    m = msg.get('message', {})
+                    if m.get('method') == 'Network.responseReceived':
+                        resp = m.get('params', {}).get('response', {})
+                        if resp.get('url') == url:
+                            status = int(resp.get('status') or 0)
+                            if status:
+                                return status
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # 方式2: 使用 JS fetch 兜底
+        try:
+            status_code = self.driver.execute_script(
+                "return new Promise((resolve)=>{fetch(arguments[0]).then(r=>resolve(r.status)).catch(()=>resolve(0));});",
+                url,
+            )
+            if status_code and int(status_code) != 0:
+                return int(status_code)
+        except Exception:
+            pass
+
+        # 方式3: 简单就绪判断推断 200（不可靠，仅兜底）
+        try:
+            if self.driver.find_elements(By.TAG_NAME, 'body') and len(self.driver.page_source) > 100:
+                return 200
+        except Exception:
+            pass
+        return 0
+        
+    def _get_page_content(self, url: str, tab_handle: str) -> Dict:
+        """在指定标签页获取页面内容"""
+        try:
+            with self._lock:
+                self.driver.switch_to.window(tab_handle)
+                
+            # 设置超时并访问页面
+            self.driver.set_page_load_timeout(self.timeout)
+            self.driver.get(url)
+            # 尝试绕过隐私拦截页
+            self._try_bypass_ssl_interstitial(fast=False)
+            
+            # 等待页面基本加载完成
+            try:
+                WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.TAG_NAME, "body"))
+                    )
+            except Exception:
+                logger.warning(f"等待页面加载超时: {url}")
+            
+            # 获取页面源码
+            source_code = self.driver.page_source
+            status_code = self._get_status_code(url)
+            
+            return {
+                'url': url,
+                'source_code': source_code,
+                'status': 'success',
+                'status_code': status_code,
+                'content_length': len(source_code)
+            }
+                
+        except Exception as e:
+            logger.error(f"获取页面内容失败 {url}: {e}")
+            return {
+                'url': url,
+                'source_code': '',
+                'status': 'failed',
+                'status_code': 0,
+                'error': str(e),
+                'content_length': 0
+            }
+    
+    def crawl_urls(self, urls: List[str], max_tabs: int = 5) -> List[Dict]:
+        """
+        单线程事件循环的“动态标签池”并发：
+        - 同时保持最多 max_tabs 个标签页在加载
+        - 谁先就绪就先采集并立刻分配下一个 URL
+        - 避免多线程争用同一 WebDriver 的不稳定性
+        """
+        if not urls:
+            return []
+
+        max_tabs = max(1, max_tabs)
+        total = len(urls)
+        url_iter = iter(enumerate(urls))
+        results_by_index: Dict[int, Dict] = {}
+
+        # 打开初始标签页集合（直接用 window.open(url)）
+        active_tabs: Dict[str, Dict] = {}  # handle -> {idx, url, start, bypassed}
+        base_handle = self.driver.current_window_handle
+        created = 0
+        while created < min(max_tabs, total):
+            try:
+                idx, u = next(url_iter)
+            except StopIteration:
+                break
+            try:
+                self.driver.execute_script("window.open(arguments[0], '_blank');", u)
+                new_handle = self.driver.window_handles[-1]
+                active_tabs[new_handle] = {'idx': idx, 'url': u, 'start': time.time(), 'bypassed': False}
+                created += 1
+            except Exception as e:
+                logger.error(f"创建初始标签失败: {e}")
+                # 记录失败并尝试继续下一条
+                results_by_index[idx] = {
+                    'url': u,
+                    'source_code': '',
+                    'status': 'failed',
+                    'error': str(e),
+                    'content_length': 0
+                }
+
+        # 事件循环：轮询所有活动标签，判定是否就绪或超时
+        poll_interval = 0.2
+        hard_kill_after = max(self.timeout * 2, self.timeout + 5)
+        while active_tabs:
+            for handle in list(active_tabs.keys()):
+                info = active_tabs.get(handle)
+                if not info:
+                    continue
+                idx = info['idx']
+                u = info['url']
+                start = info['start']
+                elapsed = time.time() - start
+                ready = False
+                try:
+                    self.driver.switch_to.window(handle)
+                    # 若尚未尝试过绕过隐私拦截，先进行一次快速尝试
+                    if not info.get('bypassed'):
+                        self._try_bypass_ssl_interstitial(fast=True)
+                        info['bypassed'] = True
+                    # 就绪判定：优先用 find_elements (更不易阻塞)
+                    try:
+                        has_body = bool(self.driver.find_elements(By.TAG_NAME, 'body'))
+                    except Exception:
+                        has_body = False
+                    # 次要就绪信号：readyState
+                    try:
+                        rs = self.driver.execute_script('return document.readyState || "";') or ""
+                    except Exception:
+                        rs = ""
+                    ready = has_body or (rs in ("interactive", "complete"))
+                except Exception as e:
+                    # 句柄异常（可能被网站自身关闭），视为失败
+                    logger.error(f"检测标签状态失败 {u}: {e}")
+                    results_by_index[idx] = {
+                        'url': u,
+                        'source_code': '',
+                        'status': 'failed',
+                        'error': str(e),
+                        'content_length': 0
+                    }
+                    # 回收并尝试补位
+                    try:
+                        self.driver.switch_to.window(handle)
+                        self.driver.close()
+                    except Exception:
+                        pass
+                    active_tabs.pop(handle, None)
+                    # 打开下一个 URL 的新标签
+                    try:
+                        idx2, u2 = next(url_iter)
+                        self.driver.switch_to.window(base_handle)
+                        self.driver.execute_script("window.open(arguments[0], '_blank');", u2)
+                        new_handle = self.driver.window_handles[-1]
+                        active_tabs[new_handle] = {'idx': idx2, 'url': u2, 'start': time.time(), 'bypassed': False}
+                    except StopIteration:
+                        pass
+                    except Exception as e2:
+                        logger.error(f"补位标签创建失败: {e2}")
+                    continue
+
+                # 若超出硬杀阈值，直接关闭并标记失败，避免无限阻塞
+                if elapsed >= hard_kill_after:
+                    logger.warning(f"标签超时强制关闭: {u} (elapsed={elapsed:.1f}s)")
+                    try:
+                        self.driver.switch_to.window(handle)
+                        self.driver.close()
+                    except Exception:
+                        pass
+                    active_tabs.pop(handle, None)
+                    results_by_index[idx] = {
+                        'url': u,
+                        'source_code': '',
+                        'status': 'failed',
+                        'error': f'timeout>{hard_kill_after}s',
+                        'content_length': 0
+                    }
+                    # 补位
+                    try:
+                        idx2, u2 = next(url_iter)
+                        self.driver.switch_to.window(base_handle)
+                        self.driver.execute_script("window.open(arguments[0], '_blank');", u2)
+                        new_handle = self.driver.window_handles[-1]
+                        active_tabs[new_handle] = {'idx': idx2, 'url': u2, 'start': time.time()}
+                    except StopIteration:
+                        pass
+                    except Exception as e2:
+                        logger.error(f"补位标签创建失败: {e2}")
+                    continue
+
+                if ready or elapsed >= self.timeout:
+                    # 采集并回收/复用标签
+                    try:
+                        self.driver.switch_to.window(handle)
+                        # 达到超时阈值时，尽量先停止加载，避免采集阻塞
+                        if not ready:
+                            try:
+                                self.driver.execute_cdp_cmd('Page.stopLoading', {})
+                            except Exception:
+                                pass
+                            try:
+                                self.driver.execute_script('window.stop && window.stop();')
+                            except Exception:
+                                pass
+                        source_code = self.driver.page_source
+                        status_code = self._get_status_code(u)
+                        results_by_index[idx] = {
+                            'url': u,
+                            'source_code': source_code,
+                            'status': 'success',
+                            'status_code': status_code,
+                            'content_length': len(source_code)
+                        }
+                    except Exception as e:
+                        logger.error(f"采集失败 {u}: {e}")
+                        results_by_index[idx] = {
+                            'url': u,
+                            'source_code': '',
+                            'status': 'failed',
+                            'status_code': 0,
+                            'error': str(e),
+                            'content_length': 0
+                        }
+                    # 关闭已完成标签，并补位下一个 URL
+                    try:
+                        self.driver.switch_to.window(handle)
+                        self.driver.close()
+                    except Exception:
+                        pass
+                    active_tabs.pop(handle, None)
+                    try:
+                        idx2, u2 = next(url_iter)
+                        self.driver.switch_to.window(base_handle)
+                        self.driver.execute_script("window.open(arguments[0], '_blank');", u2)
+                        new_handle = self.driver.window_handles[-1]
+                        active_tabs[new_handle] = {'idx': idx2, 'url': u2, 'start': time.time(), 'bypassed': False}
+                    except StopIteration:
+                        pass
+                    except Exception as e2:
+                        logger.error(f"补位标签创建失败: {e2}")
+
+            time.sleep(poll_interval)
+
+        # 回到基础窗口
+        try:
+            if base_handle in self.driver.window_handles:
+                self.driver.switch_to.window(base_handle)
+        except Exception:
+            pass
+
+        # 返回按输入顺序的结果
+        ordered = []
+        for i, u in enumerate(urls):
+            ordered.append(results_by_index.get(i, {
+                'url': u,
+                'source_code': '',
+                'status': 'failed',
+                'status_code': 0,
+                'error': 'No result',
+                'content_length': 0
+            }))
+        return ordered
+    
+    # 旧的分批实现已被动态池替换
+    
+    def _close_batch_tabs(self, tab_handles: List[str]):
+        """关闭批次中的所有标签页"""
+        for handle in tab_handles:
+            if handle:
+                try:
+                    self.driver.switch_to.window(handle)
+                    self.driver.close()
+                except Exception as e:
+                    logger.debug(f"关闭标签页失败: {e}")
+        
+        # 切换回第一个标签页
+        try:
+            if self.driver.window_handles:
+                self.driver.switch_to.window(self.driver.window_handles[0])
+        except Exception as e:
+            logger.debug(f"切换到主标签页失败: {e}")
+
+
+def get_html_sources(urls: Union[str, List[str]], 
+                    headless: bool = True, 
+                    max_tabs: int = 5,
+                    timeout: int = 30,
+                    save_to_file: str = None) -> Union[Dict, List[Dict]]:
+    """
+    获取一个或多个URL的HTML源码（简化版接口）
+    
+    :param urls: 单个URL字符串或URL列表
+    :param headless: 是否使用无头模式
+    :param max_tabs: 最大并发标签页数量
+    :param timeout: 页面加载超时时间
+    :param save_to_file: 保存结果的文件路径（可选）
+    :return: 单个URL返回Dict，多个URL返回List[Dict]
+    """
+    # 统一处理为列表
+    is_single_url = isinstance(urls, str)
+    url_list = [urls] if is_single_url else urls
+    
+    if not url_list:
+        return [] if not is_single_url else {}
+    
+    # 使用多标签页爬虫
+    with MultitabWebSpider(headless=headless, timeout=timeout) as spider:
+        results = spider.crawl_urls(url_list, max_tabs=max_tabs)
+    
+    # 保存到文件（如果指定）
+    if save_to_file and results:
+        with open(save_to_file, 'w', encoding='utf-8') as f:
+            for result in results:
+                json.dump(result, f, ensure_ascii=False)
+                f.write('\n')
+        logger.info(f"结果已保存到: {save_to_file}")
+    
+    # 返回结果
+    if is_single_url:
+        return results[0] if results else {
+            'url': urls,
+            'source_code': '',
+            'status': 'failed',
+            'error': 'No result',
+            'content_length': 0
+        }
+    else:
+        return results
 
 
 @contextmanager
-def get_webdriver(headless: bool = True, user_agent: str = None, 
-                 is_mobile: bool = False, enable_cdp: bool = False):
+def get_spider(headless: bool = True, timeout: int = 30):
     """
-    WebDriver 上下文管理器函数，提供更简洁的使用方式
+    上下文管理器方式使用爬虫
     
     Usage:
-        with get_webdriver(headless=True) as driver:
-            driver.get("https://example.com")
-            # driver 会自动关闭
+        with get_spider() as spider:
+            results = spider.crawl_urls(['http://example.com'])
     """
-    driver = None
+    spider = MultitabWebSpider(headless=headless, timeout=timeout)
     try:
-        driver = _create_driver(headless, user_agent, is_mobile, enable_cdp)
-        yield driver
+        yield spider.__enter__()
     finally:
-        if driver:
-            try:
-                driver.quit()
-                logger.debug("WebDriver 已成功关闭")
-            except Exception as e:
-                logger.warning(f"关闭 WebDriver 时出现异常: {e}")
-
-
-def get_html_source(
-    url: Union[str, List[str]], 
-    headless: bool = True,
-    return_status_code: bool = False,
-    **kwargs
-) -> Union[str, Tuple[str, int], List[Dict]]:
-    """
-    获取网页源码。
-    提供多种获取策略和更强的反检测能力，专门针对政府网站等反爬严格的网站。
-    
-    :param url: 网页链接或链接列表
-    :param headless: 是否优先使用无头模式
-    :param return_status_code: 是否返回状态码。如果为True，返回(源码, 状态码)；否则只返回源码
-    :param kwargs: 额外参数
-        - max_workers: 多线程模式下的最大工作线程数，默认为5
-        - timeout: 单个页面的超时时间，默认为60秒
-        - user_agent: 自定义User-Agent
-        - is_mobile: 是否模拟移动设备
-        - result_path: 批量模式下的结果保存路径
-        - enable_cdp: 是否启用CDP支持（用于获取状态码）
-        - avoid_redirect: 是否尽量阻止/避开前端跳转（例如5秒后跳转首页），并在初始加载完成后立即抓取源码
-        - single_instance: 批量抓取是否使用“单实例顺序抓取”（默认True，避免多线程首次创建驱动的竞态）
-    :return: 
-        - 单个URL: 根据return_status_code返回字符串或(字符串, 状态码)元组
-        - URL列表: 返回结果字典列表
-    """
-    
-    # 如果传入的是URL列表，使用多线程模式
-    if isinstance(url, list):
-        return _batch_get_html_sources(url, headless, return_status_code, **kwargs)
-    
-    # 单个URL处理
-    return _get_single_html_source(url, headless, return_status_code, **kwargs)
-
-
-def _create_driver(
-    headless: bool = True, 
-    user_agent: str = None, 
-    is_mobile: bool = False,
-    enable_cdp: bool = False
-) -> uc.Chrome:
-    """创建Chrome WebDriver实例（使用undetected-chromedriver）"""
-    options = uc.ChromeOptions()
-    
-    # 基础设置
-    if headless:
-        options.add_argument("--headless")
-        # undetected-chromedriver 在无头模式下需要额外设置
-        options.add_argument("--disable-gpu")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-    
-    # 针对政府网站的特殊配置 - 更强的反检测能力
-    common_args = [
-        "--disable-web-security",
-        "--allow-running-insecure-content",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding",
-        "--disable-features=TranslateUI",
-        "--disable-ipc-flooding-protection",
-        "--disable-default-apps",
-        "--disable-sync",
-        "--disable-translate",
-        "--hide-scrollbars",
-        "--mute-audio",
-        "--no-first-run",
-        "--safebrowsing-disable-auto-update",
-        "--disable-client-side-phishing-detection",
-        "--disable-component-update",
-        "--disable-domain-reliability",
-        "--disable-features=VizDisplayCompositor",
-        "--disable-hang-monitor",
-        "--disable-prompt-on-repost",
-        "--disable-background-networking",
-        "--disable-background-downloads",
-        "--disable-background-upload",
-        "--window-size=1920,1080",
-        "--start-maximized"
-    ]
-    
-    # 如果需要CDP支持（用于获取状态码）
-    if enable_cdp:
-        options.add_argument("--enable-logging")
-        options.add_argument("--log-level=0")
-        options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
-    
-    for arg in common_args:
-        options.add_argument(arg)
-    
-    # 设置页面加载策略
-    options.page_load_strategy = 'eager'
-    
-    # User Agent 设置
-    # 注意：undetected-chromedriver 会自动处理 user-agent 以避免被检测
-    # 只有在用户明确指定或需要移动设备模拟时才设置
-    if user_agent:
-        # 用户明确指定了 user-agent
-        options.add_argument(f"--user-agent={user_agent}")
-    elif is_mobile:
-        # 移动设备模拟需要特定的 user-agent
-        mobile_ua = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
-        options.add_argument(f"--user-agent={mobile_ua}")
-    # 否则让 undetected-chromedriver 使用它自己的默认 user-agent
-    
-    # 移动设备模拟
-    if is_mobile:
-        mobile_ua = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
-        mobile_emulation = {
-            "deviceMetrics": {"width": 375, "height": 667, "pixelRatio": 2.0},
-            "userAgent": mobile_ua,
-            "clientHints": {"mobile": True, "platform": "iOS", "platformVersion": "16.0"}
-        }
-        options.add_experimental_option("mobileEmulation", mobile_emulation)
-    
-    # 创建 undetected-chromedriver 实例
-    try:
-        # 尝试禁用 SSL 验证（仅用于下载驱动）
-        import ssl
-        ssl._create_default_https_context = ssl._create_unverified_context
-    except:
-        pass
-    
-    driver = uc.Chrome(
-        options=options,
-        use_subprocess=True,  # 使用子进程运行，提高稳定性
-        driver_executable_path=None,  # 自动下载和管理驱动
-        enable_cdp_events=enable_cdp  # 根据需要启用CDP事件支持
-    )
-    
-    # 如果启用CDP，启用网络域
-    if enable_cdp:
-        try:
-            driver.execute_cdp_cmd('Network.enable', {})
-        except Exception as e:
-            logger.debug(f"启用CDP Network域时出现异常（可忽略）: {e}")
-    
-    # undetected-chromedriver 已经内置了反检测机制，以下脚本作为额外保障
-    try:
-        driver.execute_script("""
-            // 额外的反检测措施
-            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
-            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-            
-            // 更真实的 navigator 对象
-            Object.defineProperty(navigator, 'mimeTypes', {
-                get: () => ({
-                    length: 5,
-                    0: { type: 'application/pdf', description: 'Portable Document Format' },
-                    1: { type: 'application/x-google-chrome-pdf', description: 'Portable Document Format' },
-                    2: { type: 'application/x-nacl', description: 'Native Client Executable' },
-                    3: { type: 'application/x-shockwave-flash', description: 'Shockwave Flash' },
-                    4: { type: 'application/futuresplash', description: 'FutureSplash Player' }
-                })
-            });
-        """)
-    except Exception as e:
-        logger.debug(f"执行额外反检测脚本时出现异常（可忽略）: {e}")
-    
-    return driver
-
-
-def _get_status_code_from_logs(driver: uc.Chrome, target_url: str) -> int:
-    """从浏览器日志中提取HTTP状态码"""
-    try:
-        # 方法1：通过CDP获取网络响应
-        logs = driver.get_log('performance')
-        for log in logs:
-            message = json.loads(log['message'])
-            if message['message']['method'] == 'Network.responseReceived':
-                response = message['message']['params']['response']
-                if response['url'] == target_url:
-                    return response['status']
-        
-        # 方法2：通过JavaScript获取（备用方案）
-        try:
-            status_code = driver.execute_script("""
-                return new Promise((resolve) => {
-                    fetch(arguments[0])
-                        .then(response => resolve(response.status))
-                        .catch(() => resolve(0));
-                });
-            """, target_url)
-            if status_code and status_code != 0:
-                return status_code
-        except:
-            pass
-        
-        # 方法3：检查页面状态（最后的备用方案）
-        try:
-            # 如果页面能正常加载，通常状态码是200
-            body = driver.find_element(By.TAG_NAME, "body")
-            if body and len(driver.page_source) > 100:
-                return 200
-        except:
-            pass
-            
-        return 0
-        
-    except Exception as e:
-        logger.warning(f"获取状态码失败: {e}")
-        return 0
-
-
-def _get_single_html_source(
-    url: str, 
-    headless: bool = True,
-    return_status_code: bool = False,
-    **kwargs
-) -> Union[str, Tuple[str, int]]:
-    """获取单个URL的HTML源码"""
-    timeout = kwargs.get('timeout', 60)  # 默认超时时间为60秒
-    user_agent = kwargs.get('user_agent')
-    is_mobile = kwargs.get('is_mobile', False)
-    enable_cdp = kwargs.get('enable_cdp', return_status_code)  # 如果需要状态码，自动启用CDP
-    avoid_redirect = kwargs.get('avoid_redirect', False)  # 是否尽量阻止前端跳转并尽快抓取初始源码
-    
-    def _get_html_with_driver(target_url: str, use_headless: bool = True, retry_count: int = 0) -> Tuple[str, int]:
-        """使用指定的浏览器模式获取HTML和状态码"""
-        try:
-            with get_webdriver(use_headless, user_agent, is_mobile, enable_cdp) as driver:
-                # 添加随机延迟（避免被动触发反爬）。在避免跳转时尽量缩短等待。
-                time.sleep(random.uniform(0.1, 0.5) if avoid_redirect else random.uniform(1, 3))
-                
-                # 设置超时
-                driver.set_page_load_timeout(timeout)
-                driver.implicitly_wait(10)
-                
-                # 在导航前注入脚本，尽量阻止前端跳转（location.assign/replace、href 赋值、window.open、meta refresh、定时器等）
-                if avoid_redirect:
-                    try:
-                        block_redirect_js = r"""
-                            (function() {
-                                try {
-                                    // 阻断常见的跳转API
-                                    try { history.pushState = function(){}; } catch(e) {}
-                                    try { history.replaceState = function(){}; } catch(e) {}
-                                    try {
-                                        var loc = window.location;
-                                        if (loc) {
-                                            try { loc.assign = function(){}; } catch(e) {}
-                                            try { loc.replace = function(){}; } catch(e) {}
-                                            try { loc.reload = function(){}; } catch(e) {}
-                                        }
-                                    } catch(e) {}
-
-                                    // 尝试拦截 href 赋值（部分环境可能受限）
-                                    try {
-                                        var LocProto = window.Location && window.Location.prototype;
-                                        if (LocProto) {
-                                            var hrefDesc = Object.getOwnPropertyDescriptor(LocProto, 'href');
-                                            if (hrefDesc && hrefDesc.set) {
-                                                Object.defineProperty(LocProto, 'href', {
-                                                    configurable: false,
-                                                    enumerable: hrefDesc.enumerable,
-                                                    get: hrefDesc.get,
-                                                    set: function(v) { /* block */ }
-                                                });
-                                            }
-                                        }
-                                    } catch(e) {}
-
-                                    // 阻断 window.open
-                                    try { window.open = function(){ return null; }; } catch(e) {}
-
-                                    // 阻断 Navigation API
-                                    try {
-                                        if (window.navigation) {
-                                            try { window.navigation.navigate = function(){ return Promise.resolve(); }; } catch(e) {}
-                                            try { window.navigation.back = function(){ return Promise.resolve(); }; } catch(e) {}
-                                            try { window.navigation.forward = function(){ return Promise.resolve(); }; } catch(e) {}
-                                        }
-                                    } catch(e) {}
-
-                                    // 阻断基于 setTimeout/setInterval 的跳转
-                                    try {
-                                        var _setTimeout = window.setTimeout;
-                                        window.setTimeout = function(fn, delay) {
-                                            var code = (typeof fn === 'string') ? fn : (fn && fn.toString ? fn.toString() : '');
-                                            // 拦截包含跳转关键词，或延迟较长（>= 1000ms）的定时器
-                                            if ((code && (code.indexOf('location') !== -1 || code.indexOf('href') !== -1)) || (delay && delay >= 1000)) { return 0; }
-                                            return _setTimeout.apply(window, arguments);
-                                        };
-                                        var _setInterval = window.setInterval;
-                                        window.setInterval = function(fn, delay) {
-                                            var code = (typeof fn === 'string') ? fn : (fn && fn.toString ? fn.toString() : '');
-                                            if ((code && (code.indexOf('location') !== -1 || code.indexOf('href') !== -1)) || (delay && delay >= 1000)) { return 0; }
-                                            return _setInterval.apply(window, arguments);
-                                        };
-                                    } catch(e) {}
-
-                                    // 移除 meta refresh
-                                    try {
-                                        var removeRefreshMeta = function(doc) {
-                                            try {
-                                                var metas = doc.getElementsByTagName('meta');
-                                                for (var i = metas.length - 1; i >= 0; i--) {
-                                                    var m = metas[i];
-                                                    var hv = m.getAttribute('http-equiv');
-                                                    if (hv && hv.toLowerCase() === 'refresh') {
-                                                        m.parentNode && m.parentNode.removeChild(m);
-                                                    }
-                                                }
-                                            } catch(e) {}
-                                        };
-                                        document.addEventListener('DOMContentLoaded', function(){ removeRefreshMeta(document); }, true);
-                                        removeRefreshMeta(document);
-                                        document.addEventListener('DOMNodeInserted', function(e){
-                                            try {
-                                                var t = e && e.target;
-                                                if (t && t.tagName === 'META') {
-                                                    var hv = t.getAttribute('http-equiv');
-                                                    if (hv && hv.toLowerCase() === 'refresh') {
-                                                        t.parentNode && t.parentNode.removeChild(t);
-                                                    }
-                                                }
-                                            } catch(_) {}
-                                        }, true);
-                                    } catch(e) {}
-
-                                    // 伪装可见性，避免基于隐藏/失焦触发的跳转策略
-                                    try {
-                                        Object.defineProperty(document, 'hidden', { get: function(){ return false; } });
-                                        Object.defineProperty(document, 'visibilityState', { get: function(){ return 'visible'; } });
-                                        var _addEventListener = document.addEventListener;
-                                        document.addEventListener = function(type, listener, options){
-                                            if (type === 'visibilitychange' || type === 'pagehide' || type === 'beforeunload' || type === 'unload') { return; }
-                                            return _addEventListener.call(document, type, listener, options);
-                                        };
-                                        window.onbeforeunload = null;
-                                        window.onunload = null;
-                                    } catch(e) {}
-                                } catch(e) {}
-                            })();
-                        """
-                        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                            'source': block_redirect_js
-                        })
-                    except Exception as inject_err:
-                        logger.debug(f"注入阻止跳转脚本失败: {inject_err}")
-
-                # 访问页面
-                driver.get(target_url)
-                
-                # 获取状态码（如果需要）
-                status_code = 0
-                if return_status_code or enable_cdp:
-                    status_code = _get_status_code_from_logs(driver, target_url)
-                
-                # 等待页面加载
-                try:
-                    if avoid_redirect:
-                        WebDriverWait(driver, 2).until(
-                            EC.presence_of_element_located((By.TAG_NAME, "body"))
-                        )
-                    else:
-                        WebDriverWait(driver, 10).until(
-                            EC.presence_of_element_located((By.TAG_NAME, "body"))
-                        )
-                except Exception as e:
-                    logger.warning(f"等待body元素超时: {e}")
-                
-                # 如果需要避免跳转，则在初始加载就立刻抓取源码，尽量避免被5秒后跳转
-                if avoid_redirect:
-                    try:
-                        # 尝试立即停止继续加载，防止后续脚本触发跳转
-                        try:
-                            driver.execute_cdp_cmd('Page.stopLoading', {})
-                        except Exception:
-                            pass
-                        try:
-                            driver.execute_script('window.stop && window.stop();')
-                        except Exception:
-                            pass
-                        final_source = driver.page_source
-                        final_source = final_source.encode("utf8").decode()
-                        if return_status_code:
-                            logger.info(f'成功获取页面初始源码（避免跳转）：{target_url}，长度：{len(final_source)}，状态码：{status_code}')
-                            return final_source, status_code
-                        else:
-                            logger.info(f'成功获取页面初始源码（避免跳转）：{target_url}，长度：{len(final_source)}')
-                            return final_source, status_code
-                    except Exception as early_err:
-                        logger.warning(f"快速抓取初始源码失败，尝试常规流程: {early_err}")
-
-                # 处理特殊阻止页面
-                page_source = driver.page_source
-                if 'Bitdefender Endpoint Security Tools 阻止了这个页面' in page_source:
-                    logger.info('Bitdefender Endpoint Security Tools 阻止了这个页面，正在点击跳过')
-                    try:
-                        wait = WebDriverWait(driver, 10)
-                        element = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#takeMeThere a")))
-                        element.click()
-                        time.sleep(5)
-                        page_source = driver.page_source
-                        # 重新获取状态码
-                        if return_status_code or enable_cdp:
-                            status_code = _get_status_code_from_logs(driver, target_url)
-                    except Exception as skip_error:
-                        logger.warning(f"点击跳过失败: {skip_error}")
-                
-                # 等待页面稳定
-                time.sleep(3 + retry_count)
-                
-                # 滚动页面以触发懒加载内容
-                try:
-                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(1)
-                    driver.execute_script("window.scrollTo(0, 0);")
-                    time.sleep(1)
-                except Exception as scroll_error:
-                    logger.warning(f"页面滚动失败: {scroll_error}")
-                
-                # 获取最终的页面源码
-                final_source = driver.page_source
-                final_source = final_source.encode("utf8").decode()
-                
-                # 检查是否获取到有效内容
-                if len(final_source.strip()) < 100:
-                    logger.warning(f"获取到的内容过少，可能被拦截: {len(final_source)} 字符")
-                    if retry_count < 2:  # 最多重试2次
-                        logger.info(f"尝试第 {retry_count + 1} 次重试...")
-                        # driver 会在 with 语句结束时自动关闭
-                        return _get_html_with_driver(target_url, use_headless, retry_count + 1)
-                
-                if return_status_code:
-                    logger.info(f'成功获取页面源码：{target_url}，长度：{len(final_source)}，状态码：{status_code}')
-                else:
-                    logger.info(f'成功获取页面源码：{target_url}，长度：{len(final_source)}')
-                
-                return final_source, status_code
-                # driver 会在这里自动关闭
-                
-        except Exception as e:
-            logger.error(f"获取页面时出错: {target_url}, 错误: {str(e)}")
-            if retry_count < 2:
-                logger.info(f"尝试第 {retry_count + 1} 次重试...")
-                # 每次重试都会创建新的 driver 实例并自动管理
-                return _get_html_with_driver(target_url, use_headless, retry_count + 1)
-            return '', 0
-    
-    def _try_with_different_strategies(target_url: str, preferred_headless: bool) -> Tuple[str, int]:
-        """尝试不同的获取策略"""
-        
-        if preferred_headless:
-            # 策略1: 无头模式
-            try:
-                logger.info("策略1: 使用无头模式 - headless=True")
-                result, status_code = _get_html_with_driver(target_url, use_headless=True)
-                if result and len(result.strip()) > 100:
-                    logger.info("策略1成功获取到内容")
-                    return result, status_code
-            except Exception as e:
-                logger.warning(f"策略1 headless=True失败: {e}")
-                
-            # 策略2: 有头模式
-            try:
-                logger.info("策略2: 使用有头模式 - headless=False")
-                result, status_code = _get_html_with_driver(target_url, use_headless=False)
-                if result and len(result.strip()) > 100:
-                    logger.info("策略2成功获取到内容")
-                    return result, status_code
-            except Exception as e:
-                logger.warning(f"策略2 headless=False失败: {e}")
-        else:
-            # 如果不使用无头模式，仅使用有头模式
-            try:
-                logger.info("策略1: 使用有头模式 - headless=False")
-                result, status_code = _get_html_with_driver(target_url, use_headless=False)
-                if result and len(result.strip()) > 100:
-                    logger.info("策略1成功获取到内容")
-                    return result, status_code
-            except Exception as e:
-                logger.warning(f"策略1 headless=False失败: {e}")
-        
-        return "", 0
-    
-    # 直接使用原始URL
-    logger.info(f"尝试获取: {url}, headless模式: {headless}, 返回状态码: {return_status_code}")
-    result, status_code = _try_with_different_strategies(url, headless)
-    
-    if not result:
-        logger.error(f"所有策略均失败，无法获取源码: {url}")
-        if return_status_code:
-            return "", 0
-        else:
-            return ""
-    
-    # 根据参数返回不同格式的结果
-    if return_status_code:
-        return result, status_code
-    else:
-        return result
-
-
-def _batch_get_html_sources(
-    url_list: List[str], 
-    headless: bool = True,
-    return_status_code: bool = False,
-    **kwargs
-) -> List[Dict]:
-    """批量获取多个URL的HTML源码（多线程模式）"""
-    max_workers = kwargs.get('max_workers', 5)
-    result_path = kwargs.get('result_path', 'results.jsonl' if not return_status_code else 'results_with_status.jsonl')
-    
-    # 启动线程池进行爬取
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        logger.info(f'正在并发启动{max_workers}个Chrome实例，耗时较长请等待......')
-        
-        # 分配任务 - 保持顺序
-        future_to_index = {}
-        for index, url in enumerate(url_list):
-            future = executor.submit(_get_single_html_source, url, headless, return_status_code, **kwargs)
-            future_to_index[future] = index
-        
-        # 创建结果数组，保持原始顺序
-        results = [None] * len(url_list)
-        
-        # 收集结果
-        for future in as_completed(future_to_index):
-            index = future_to_index[future]
-            url = url_list[index]
-            try:
-                # 设置超时
-                timeout = kwargs.get('timeout', 60)
-                result = future.result(timeout=timeout)
-                
-                if return_status_code:
-                    source_code, status_code = result
-                    result_dict = {'url': url, 'source_code': source_code, 'status_code': status_code}
-                else:
-                    source_code = result
-                    result_dict = {'url': url, 'source_code': source_code}
-                
-                results[index] = result_dict
-            except Exception as e:
-                logger.error(f"Error for {url}: {str(e)}")
-                if return_status_code:
-                    result_dict = {'url': url, 'source_code': '', 'status_code': 0}
-                else:
-                    result_dict = {'url': url, 'source_code': ''}
-                results[index] = result_dict
-    
-    # 按原始顺序写入JSONL文件
-    with open(result_path, 'w', encoding='utf-8') as f:  # 使用'w'模式覆盖文件
-        for result in results:
-            json.dump(result, f, ensure_ascii=False)
-            f.write("\n")  # 每个 JSON 对象占一行
-    
-    logger.info(f"所有任务已完成，结果已按原始顺序保存到 {result_path}")
-    return results
+        spider.__exit__(None, None, None)
 
 
 if __name__ == '__main__':
-    # 示例：测试单个URL
-    # test_url = "http://www.chinattl.com/"
-    #
-    # print("=== 测试单个URL ===")
-    # # 测试获取源码和状态码
-    # print("\n=== 测试获取源码和状态码 ===")
-    # html_source, status_code = get_html_source(test_url, headless=False, return_status_code=True, avoid_redirect=True)
-    # if html_source:
-    #     print(html_source)
-    #     print(f"成功获取HTML源码，长度: {len(html_source)}，状态码: {status_code}")
-    # else:
-    #     print("获取HTML源码失败")
-
-    # 示例：测试批量获取
-    # url_list = [
-    #     "http://www.chinattl.com/",
-    #     "https://www.gov.cn/",
-    # ]
-    with open('urls.txt', 'r', encoding='utf-8') as f:
-        url_list = [line.strip() for line in f if line.strip()]
-
-    print("\n=== 测试批量获取（包含状态码） ===")
-    results_with_status = get_html_source(
+    # 读取URL列表
+    try:
+        with open('urls.txt', 'r', encoding='utf-8') as f:
+            url_list = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        # 如果没有urls.txt文件，使用示例URL
+        url_list = [
+            "https://www.baidu.com",
+            "https://www.github.com",
+            "https://www.google.com",
+            "https://www.stackoverflow.com"
+        ]
+        logger.info("未找到urls.txt文件，使用示例URL进行测试")
+    
+    print(f"开始爬取 {len(url_list)} 个URL...")
+    
+    # 使用简化接口进行批量爬取
+    results = get_html_sources(
         url_list,
-        headless=False,
-        return_status_code=True,
-        max_workers=5,
-        result_path='test_results_with_status_avoid_redirect.jsonl',
-        avoid_redirect=True  # 避免前端跳转
+        headless=False,  # 使用有头模式便于观察
+        max_tabs=5,      # 最多同时5个标签页
+        timeout=30,      # 30秒超时
+        save_to_file='crawl_results.jsonl'
     )
-
-    print(f"\n批量处理完成，共处理 {len(results_with_status)} 个URL")
-    for result in results_with_status:
+    
+    # 输出统计信息
+    print(f"\n爬取完成！共处理 {len(results)} 个URL")
+    success_count = len([r for r in results if r['status'] == 'success'])
+    print(f"成功: {success_count}, 失败: {len(results) - success_count}")
+    
+    # 显示详细结果
+    for result in results:
         url = result['url']
-        content_length = len(result['source_code'])
-        status_code = result.get('status_code', 0)
-        status = "成功" if content_length > 0 else "失败"
+        status = result['status']
+        length = result['content_length']
         print(f"URL: {url}")
-        print(f"  状态: {status}, 内容长度: {content_length}, HTTP状态码: {status_code}")
+        print(f"  状态: {status}, 内容长度: {length}")
+        if status == 'failed' and 'error' in result:
+            print(f"  错误: {result['error']}")
+        print()
