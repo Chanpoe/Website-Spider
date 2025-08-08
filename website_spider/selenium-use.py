@@ -1,5 +1,6 @@
 import json
 import time
+import os
 import random
 import threading
 from queue import Queue
@@ -36,36 +37,36 @@ class MultitabWebSpider:
         options = uc.ChromeOptions()
         
         if self.headless:
-            options.add_argument("--headless")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
+            # 使用新版 headless，指纹更自然
+            options.add_argument("--headless=new")
         
-        # 基础优化配置
+        # 自然化、尽量最少参数
         basic_args = [
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--disable-web-security",
-            "--ignore-certificate-errors",
-            "--allow-insecure-localhost",
-            "--allow-running-insecure-content",
             "--window-size=1920,1080",
-            "--start-maximized",
         ]
         for arg in basic_args:
             options.add_argument(arg)
         
-        # 设置页面加载策略为eager，加快加载速度
-        options.page_load_strategy = 'eager'
-
-        # 开启 performance 日志，后续用于提取 HTTP 状态码
+        # 语言与区域，贴近真实用户
+        options.add_argument("--lang=zh-CN,zh;q=0.9,en;q=0.8")
         try:
-            options.add_argument("--enable-logging")
-            options.add_argument("--log-level=0")
-            options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+            options.add_experimental_option("prefs", {"intl.accept_languages": "zh-CN,zh"})
         except Exception:
             pass
+
+        # 降低自动化可观测性（此环境对 excludeSwitches/useAutomationExtension 不兼容，跳过）
+
+        # 使用持久化用户目录，减少“新装浏览器”指纹
+        try:
+            profile_dir = os.path.join(os.path.expanduser("~"), ".uc_chrome_profile")
+            options.add_argument(f"--user-data-dir={profile_dir}")
+        except Exception:
+            pass
+
+        # 设置页面加载策略为 eager（也可用 normal，按需）
+        options.page_load_strategy = 'eager'
+
+        # 不主动开启 performance 日志，减少可疑信号；状态码改用 JS fetch 兜底
 
         # 解决 UC 下载驱动时在部分 macOS 环境下的证书校验错误
         try:
@@ -74,19 +75,11 @@ class MultitabWebSpider:
         except Exception:
             pass
 
-        # 接受不安全证书
-        try:
-            options.set_capability('acceptInsecureCerts', True)
-        except Exception:
-            pass
+        # 可选：接受不安全证书（保持默认，不强行声明）
 
-        driver = uc.Chrome(options=options, use_subprocess=True, driver_executable_path=None, enable_cdp_events=True)
+        driver = uc.Chrome(options=options, use_subprocess=True, driver_executable_path=None, enable_cdp_events=False)
 
-        # 尝试开启 CDP 网络域
-        try:
-            driver.execute_cdp_cmd('Network.enable', {})
-        except Exception:
-            pass
+        # 不强行开启 CDP 网络域
 
         return driver
     
@@ -535,6 +528,26 @@ def get_spider(headless: bool = True, timeout: int = 30):
 
 
 if __name__ == '__main__':
+    # # 单站验证：chinattl
+    # test_url = "http://www.chinattl.com/"
+    # print("开始单站验证: ", test_url)
+
+    # # 使用简化接口但限制为单标签（等效单站）
+    # results = get_html_sources(
+    #     [test_url],
+    #     headless=False,
+    #     max_tabs=1,
+    #     timeout=30,
+    #     save_to_file=None,
+    # )
+
+    # r = results[0] if results else {}
+    # content_len = r.get('content_length', 0)
+    # status = r.get('status')
+    # print(f"结果: 状态={status}, 内容长度={content_len}")
+    # if status != 'success':
+    #     print("失败详情:", r)
+
     # 读取URL列表
     try:
         with open('urls.txt', 'r', encoding='utf-8') as f:
