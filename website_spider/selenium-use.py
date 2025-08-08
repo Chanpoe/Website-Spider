@@ -6,12 +6,71 @@ from queue import Queue
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict, Tuple, Union, Literal
+from contextlib import contextmanager
 
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
 from loguru import logger
+
+
+class WebDriverManager:
+    """
+    WebDriver 上下文管理器，确保 undetected_chromedriver 资源正确管理
+    """
+    def __init__(self, headless: bool = True, user_agent: str = None, 
+                 is_mobile: bool = False, enable_cdp: bool = False):
+        self.headless = headless
+        self.user_agent = user_agent
+        self.is_mobile = is_mobile
+        self.enable_cdp = enable_cdp
+        self.driver = None
+    
+    def __enter__(self):
+        """进入上下文时创建WebDriver实例"""
+        self.driver = _create_driver(
+            self.headless, 
+            self.user_agent, 
+            self.is_mobile, 
+            self.enable_cdp
+        )
+        return self.driver
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """退出上下文时确保WebDriver被正确关闭"""
+        if self.driver:
+            try:
+                self.driver.quit()
+                logger.debug("WebDriver 已成功关闭")
+            except Exception as e:
+                logger.warning(f"关闭 WebDriver 时出现异常: {e}")
+            finally:
+                self.driver = None
+
+
+@contextmanager
+def get_webdriver(headless: bool = True, user_agent: str = None, 
+                 is_mobile: bool = False, enable_cdp: bool = False):
+    """
+    WebDriver 上下文管理器函数，提供更简洁的使用方式
+    
+    Usage:
+        with get_webdriver(headless=True) as driver:
+            driver.get("https://example.com")
+            # driver 会自动关闭
+    """
+    driver = None
+    try:
+        driver = _create_driver(headless, user_agent, is_mobile, enable_cdp)
+        yield driver
+    finally:
+        if driver:
+            try:
+                driver.quit()
+                logger.debug("WebDriver 已成功关闭")
+            except Exception as e:
+                logger.warning(f"关闭 WebDriver 时出现异常: {e}")
 
 
 def get_html_source(
@@ -34,6 +93,8 @@ def get_html_source(
         - is_mobile: 是否模拟移动设备
         - result_path: 批量模式下的结果保存路径
         - enable_cdp: 是否启用CDP支持（用于获取状态码）
+        - avoid_redirect: 是否尽量阻止/避开前端跳转（例如5秒后跳转首页），并在初始加载完成后立即抓取源码
+        - single_instance: 批量抓取是否使用“单实例顺序抓取”（默认True，避免多线程首次创建驱动的竞态）
     :return: 
         - 单个URL: 根据return_status_code返回字符串或(字符串, 状态码)元组
         - URL列表: 返回结果字典列表
@@ -137,7 +198,6 @@ def _create_driver(
     
     driver = uc.Chrome(
         options=options,
-        version_main=138,  # 指定Chrome版本为138
         use_subprocess=True,  # 使用子进程运行，提高稳定性
         driver_executable_path=None,  # 自动下载和管理驱动
         enable_cdp_events=enable_cdp  # 根据需要启用CDP事件支持
@@ -228,94 +288,231 @@ def _get_single_html_source(
     user_agent = kwargs.get('user_agent')
     is_mobile = kwargs.get('is_mobile', False)
     enable_cdp = kwargs.get('enable_cdp', return_status_code)  # 如果需要状态码，自动启用CDP
+    avoid_redirect = kwargs.get('avoid_redirect', False)  # 是否尽量阻止前端跳转并尽快抓取初始源码
     
     def _get_html_with_driver(target_url: str, use_headless: bool = True, retry_count: int = 0) -> Tuple[str, int]:
         """使用指定的浏览器模式获取HTML和状态码"""
-        driver = None
         try:
-            driver = _create_driver(use_headless, user_agent, is_mobile, enable_cdp)
-            
-            # 添加随机延迟
-            time.sleep(random.uniform(1, 3))
-            
-            # 设置超时
-            driver.set_page_load_timeout(timeout)
-            driver.implicitly_wait(10)
-            
-            # 访问页面
-            driver.get(target_url)
-            
-            # 获取状态码（如果需要）
-            status_code = 0
-            if return_status_code or enable_cdp:
-                status_code = _get_status_code_from_logs(driver, target_url)
-            
-            # 等待页面加载
-            try:
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "body"))
-                )
-            except Exception as e:
-                logger.warning(f"等待body元素超时: {e}")
-            
-            # 处理特殊阻止页面
-            page_source = driver.page_source
-            if 'Bitdefender Endpoint Security Tools 阻止了这个页面' in page_source:
-                logger.info('Bitdefender Endpoint Security Tools 阻止了这个页面，正在点击跳过')
+            with get_webdriver(use_headless, user_agent, is_mobile, enable_cdp) as driver:
+                # 添加随机延迟（避免被动触发反爬）。在避免跳转时尽量缩短等待。
+                time.sleep(random.uniform(0.1, 0.5) if avoid_redirect else random.uniform(1, 3))
+                
+                # 设置超时
+                driver.set_page_load_timeout(timeout)
+                driver.implicitly_wait(10)
+                
+                # 在导航前注入脚本，尽量阻止前端跳转（location.assign/replace、href 赋值、window.open、meta refresh、定时器等）
+                if avoid_redirect:
+                    try:
+                        block_redirect_js = r"""
+                            (function() {
+                                try {
+                                    // 阻断常见的跳转API
+                                    try { history.pushState = function(){}; } catch(e) {}
+                                    try { history.replaceState = function(){}; } catch(e) {}
+                                    try {
+                                        var loc = window.location;
+                                        if (loc) {
+                                            try { loc.assign = function(){}; } catch(e) {}
+                                            try { loc.replace = function(){}; } catch(e) {}
+                                            try { loc.reload = function(){}; } catch(e) {}
+                                        }
+                                    } catch(e) {}
+
+                                    // 尝试拦截 href 赋值（部分环境可能受限）
+                                    try {
+                                        var LocProto = window.Location && window.Location.prototype;
+                                        if (LocProto) {
+                                            var hrefDesc = Object.getOwnPropertyDescriptor(LocProto, 'href');
+                                            if (hrefDesc && hrefDesc.set) {
+                                                Object.defineProperty(LocProto, 'href', {
+                                                    configurable: false,
+                                                    enumerable: hrefDesc.enumerable,
+                                                    get: hrefDesc.get,
+                                                    set: function(v) { /* block */ }
+                                                });
+                                            }
+                                        }
+                                    } catch(e) {}
+
+                                    // 阻断 window.open
+                                    try { window.open = function(){ return null; }; } catch(e) {}
+
+                                    // 阻断 Navigation API
+                                    try {
+                                        if (window.navigation) {
+                                            try { window.navigation.navigate = function(){ return Promise.resolve(); }; } catch(e) {}
+                                            try { window.navigation.back = function(){ return Promise.resolve(); }; } catch(e) {}
+                                            try { window.navigation.forward = function(){ return Promise.resolve(); }; } catch(e) {}
+                                        }
+                                    } catch(e) {}
+
+                                    // 阻断基于 setTimeout/setInterval 的跳转
+                                    try {
+                                        var _setTimeout = window.setTimeout;
+                                        window.setTimeout = function(fn, delay) {
+                                            var code = (typeof fn === 'string') ? fn : (fn && fn.toString ? fn.toString() : '');
+                                            // 拦截包含跳转关键词，或延迟较长（>= 1000ms）的定时器
+                                            if ((code && (code.indexOf('location') !== -1 || code.indexOf('href') !== -1)) || (delay && delay >= 1000)) { return 0; }
+                                            return _setTimeout.apply(window, arguments);
+                                        };
+                                        var _setInterval = window.setInterval;
+                                        window.setInterval = function(fn, delay) {
+                                            var code = (typeof fn === 'string') ? fn : (fn && fn.toString ? fn.toString() : '');
+                                            if ((code && (code.indexOf('location') !== -1 || code.indexOf('href') !== -1)) || (delay && delay >= 1000)) { return 0; }
+                                            return _setInterval.apply(window, arguments);
+                                        };
+                                    } catch(e) {}
+
+                                    // 移除 meta refresh
+                                    try {
+                                        var removeRefreshMeta = function(doc) {
+                                            try {
+                                                var metas = doc.getElementsByTagName('meta');
+                                                for (var i = metas.length - 1; i >= 0; i--) {
+                                                    var m = metas[i];
+                                                    var hv = m.getAttribute('http-equiv');
+                                                    if (hv && hv.toLowerCase() === 'refresh') {
+                                                        m.parentNode && m.parentNode.removeChild(m);
+                                                    }
+                                                }
+                                            } catch(e) {}
+                                        };
+                                        document.addEventListener('DOMContentLoaded', function(){ removeRefreshMeta(document); }, true);
+                                        removeRefreshMeta(document);
+                                        document.addEventListener('DOMNodeInserted', function(e){
+                                            try {
+                                                var t = e && e.target;
+                                                if (t && t.tagName === 'META') {
+                                                    var hv = t.getAttribute('http-equiv');
+                                                    if (hv && hv.toLowerCase() === 'refresh') {
+                                                        t.parentNode && t.parentNode.removeChild(t);
+                                                    }
+                                                }
+                                            } catch(_) {}
+                                        }, true);
+                                    } catch(e) {}
+
+                                    // 伪装可见性，避免基于隐藏/失焦触发的跳转策略
+                                    try {
+                                        Object.defineProperty(document, 'hidden', { get: function(){ return false; } });
+                                        Object.defineProperty(document, 'visibilityState', { get: function(){ return 'visible'; } });
+                                        var _addEventListener = document.addEventListener;
+                                        document.addEventListener = function(type, listener, options){
+                                            if (type === 'visibilitychange' || type === 'pagehide' || type === 'beforeunload' || type === 'unload') { return; }
+                                            return _addEventListener.call(document, type, listener, options);
+                                        };
+                                        window.onbeforeunload = null;
+                                        window.onunload = null;
+                                    } catch(e) {}
+                                } catch(e) {}
+                            })();
+                        """
+                        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                            'source': block_redirect_js
+                        })
+                    except Exception as inject_err:
+                        logger.debug(f"注入阻止跳转脚本失败: {inject_err}")
+
+                # 访问页面
+                driver.get(target_url)
+                
+                # 获取状态码（如果需要）
+                status_code = 0
+                if return_status_code or enable_cdp:
+                    status_code = _get_status_code_from_logs(driver, target_url)
+                
+                # 等待页面加载
                 try:
-                    wait = WebDriverWait(driver, 10)
-                    element = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#takeMeThere a")))
-                    element.click()
-                    time.sleep(5)
-                    page_source = driver.page_source
-                    # 重新获取状态码
-                    if return_status_code or enable_cdp:
-                        status_code = _get_status_code_from_logs(driver, target_url)
-                except Exception as skip_error:
-                    logger.warning(f"点击跳过失败: {skip_error}")
-            
-            # 等待页面稳定
-            time.sleep(3 + retry_count)
-            
-            # 滚动页面以触发懒加载内容
-            try:
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(1)
-                driver.execute_script("window.scrollTo(0, 0);")
-                time.sleep(1)
-            except Exception as scroll_error:
-                logger.warning(f"页面滚动失败: {scroll_error}")
-            
-            # 获取最终的页面源码
-            final_source = driver.page_source
-            final_source = final_source.encode("utf8").decode()
-            
-            # 检查是否获取到有效内容
-            if len(final_source.strip()) < 100:
-                logger.warning(f"获取到的内容过少，可能被拦截: {len(final_source)} 字符")
-                if retry_count < 2:  # 最多重试2次
-                    logger.info(f"尝试第 {retry_count + 1} 次重试...")
-                    driver.quit()
-                    return _get_html_with_driver(target_url, use_headless, retry_count + 1)
-            
-            if return_status_code:
-                logger.info(f'成功获取页面源码：{target_url}，长度：{len(final_source)}，状态码：{status_code}')
-            else:
-                logger.info(f'成功获取页面源码：{target_url}，长度：{len(final_source)}')
-            
-            return final_source, status_code
-            
+                    if avoid_redirect:
+                        WebDriverWait(driver, 2).until(
+                            EC.presence_of_element_located((By.TAG_NAME, "body"))
+                        )
+                    else:
+                        WebDriverWait(driver, 10).until(
+                            EC.presence_of_element_located((By.TAG_NAME, "body"))
+                        )
+                except Exception as e:
+                    logger.warning(f"等待body元素超时: {e}")
+                
+                # 如果需要避免跳转，则在初始加载就立刻抓取源码，尽量避免被5秒后跳转
+                if avoid_redirect:
+                    try:
+                        # 尝试立即停止继续加载，防止后续脚本触发跳转
+                        try:
+                            driver.execute_cdp_cmd('Page.stopLoading', {})
+                        except Exception:
+                            pass
+                        try:
+                            driver.execute_script('window.stop && window.stop();')
+                        except Exception:
+                            pass
+                        final_source = driver.page_source
+                        final_source = final_source.encode("utf8").decode()
+                        if return_status_code:
+                            logger.info(f'成功获取页面初始源码（避免跳转）：{target_url}，长度：{len(final_source)}，状态码：{status_code}')
+                            return final_source, status_code
+                        else:
+                            logger.info(f'成功获取页面初始源码（避免跳转）：{target_url}，长度：{len(final_source)}')
+                            return final_source, status_code
+                    except Exception as early_err:
+                        logger.warning(f"快速抓取初始源码失败，尝试常规流程: {early_err}")
+
+                # 处理特殊阻止页面
+                page_source = driver.page_source
+                if 'Bitdefender Endpoint Security Tools 阻止了这个页面' in page_source:
+                    logger.info('Bitdefender Endpoint Security Tools 阻止了这个页面，正在点击跳过')
+                    try:
+                        wait = WebDriverWait(driver, 10)
+                        element = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#takeMeThere a")))
+                        element.click()
+                        time.sleep(5)
+                        page_source = driver.page_source
+                        # 重新获取状态码
+                        if return_status_code or enable_cdp:
+                            status_code = _get_status_code_from_logs(driver, target_url)
+                    except Exception as skip_error:
+                        logger.warning(f"点击跳过失败: {skip_error}")
+                
+                # 等待页面稳定
+                time.sleep(3 + retry_count)
+                
+                # 滚动页面以触发懒加载内容
+                try:
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(1)
+                    driver.execute_script("window.scrollTo(0, 0);")
+                    time.sleep(1)
+                except Exception as scroll_error:
+                    logger.warning(f"页面滚动失败: {scroll_error}")
+                
+                # 获取最终的页面源码
+                final_source = driver.page_source
+                final_source = final_source.encode("utf8").decode()
+                
+                # 检查是否获取到有效内容
+                if len(final_source.strip()) < 100:
+                    logger.warning(f"获取到的内容过少，可能被拦截: {len(final_source)} 字符")
+                    if retry_count < 2:  # 最多重试2次
+                        logger.info(f"尝试第 {retry_count + 1} 次重试...")
+                        # driver 会在 with 语句结束时自动关闭
+                        return _get_html_with_driver(target_url, use_headless, retry_count + 1)
+                
+                if return_status_code:
+                    logger.info(f'成功获取页面源码：{target_url}，长度：{len(final_source)}，状态码：{status_code}')
+                else:
+                    logger.info(f'成功获取页面源码：{target_url}，长度：{len(final_source)}')
+                
+                return final_source, status_code
+                # driver 会在这里自动关闭
+                
         except Exception as e:
             logger.error(f"获取页面时出错: {target_url}, 错误: {str(e)}")
             if retry_count < 2:
                 logger.info(f"尝试第 {retry_count + 1} 次重试...")
-                if driver:
-                    driver.quit()
+                # 每次重试都会创建新的 driver 实例并自动管理
                 return _get_html_with_driver(target_url, use_headless, retry_count + 1)
             return '', 0
-        finally:
-            if driver:
-                driver.quit()
     
     def _try_with_different_strategies(target_url: str, preferred_headless: bool) -> Tuple[str, int]:
         """尝试不同的获取策略"""
@@ -430,33 +627,37 @@ def _batch_get_html_sources(
 
 
 if __name__ == '__main__':
-    # # 示例：测试单个URL
+    # 示例：测试单个URL
     # test_url = "http://www.chinattl.com/"
-
+    #
     # print("=== 测试单个URL ===")
     # # 测试获取源码和状态码
     # print("\n=== 测试获取源码和状态码 ===")
-    # html_source, status_code = get_html_source(test_url, headless=False, return_status_code=True)
+    # html_source, status_code = get_html_source(test_url, headless=False, return_status_code=True, avoid_redirect=True)
     # if html_source:
+    #     print(html_source)
     #     print(f"成功获取HTML源码，长度: {len(html_source)}，状态码: {status_code}")
     # else:
     #     print("获取HTML源码失败")
 
     # 示例：测试批量获取
-    url_list = [
-        "http://www.chinattl.com/",
-        "https://www.gov.cn/",
-    ]
-    
+    # url_list = [
+    #     "http://www.chinattl.com/",
+    #     "https://www.gov.cn/",
+    # ]
+    with open('urls.txt', 'r', encoding='utf-8') as f:
+        url_list = [line.strip() for line in f if line.strip()]
+
     print("\n=== 测试批量获取（包含状态码） ===")
     results_with_status = get_html_source(
-        url_list, 
-        headless=False, 
+        url_list,
+        headless=False,
         return_status_code=True,
-        max_workers=2,
-        result_path='test_results_with_status.jsonl'
+        max_workers=5,
+        result_path='test_results_with_status_avoid_redirect.jsonl',
+        avoid_redirect=True  # 避免前端跳转
     )
-    
+
     print(f"\n批量处理完成，共处理 {len(results_with_status)} 个URL")
     for result in results_with_status:
         url = result['url']
