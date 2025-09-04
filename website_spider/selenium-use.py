@@ -17,7 +17,6 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
 from loguru import logger
-
 # 降低 urllib3 对连接重试的噪声日志级别，避免在 driver 关闭时刷 Warning
 try:
     logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
@@ -42,7 +41,6 @@ class MultitabWebSpider:
 
     def _create_driver(self) -> uc.Chrome:
         """创建Chrome WebDriver实例"""
-
         # 进程间文件锁，避免 undetected_chromedriver 并发下载/改名驱动时产生竞态
         def _acquire_uc_lock() -> int:
             try:
@@ -69,7 +67,6 @@ class MultitabWebSpider:
                     os.close(fd)
                 except Exception:
                     pass
-
         options = uc.ChromeOptions()
 
         if self.headless:
@@ -113,7 +110,17 @@ class MultitabWebSpider:
         # （保留语言设置无伤大雅）
         try:
             options.add_argument("--lang=zh-CN,zh;q=0.9,en;q=0.8")
-            options.add_experimental_option("prefs", {"intl.accept_languages": "zh-CN,zh"})
+            # 设置下载路径，禁止下载弹窗，避免驱动挂起
+            download_dir = os.path.join(os.path.expanduser("~"), "selenium_downloads")
+            os.makedirs(download_dir, exist_ok=True)
+            prefs = {
+                "intl.accept_languages": "zh-CN,zh",
+                "download.default_directory": download_dir,
+                "download.prompt_for_download": False,
+                "download.directory_upgrade": True,
+                "safebrowsing.enabled": True,
+            }
+            options.add_experimental_option("prefs", prefs)
         except Exception:
             pass
 
@@ -329,7 +336,11 @@ class MultitabWebSpider:
                 logger.warning(f"等待页面加载超时: {url}")
 
             # 获取页面源码
-            source_code = self.driver.page_source
+            try:
+                source_code = self.driver.execute_script("return document.documentElement.outerHTML;") or ""
+            except Exception as e:
+                logger.warning(f"获取源码失败 (JS): {url}, error: {e}")
+                source_code = ""
             status_code = self._get_status_code(url)
 
             return {
@@ -342,6 +353,9 @@ class MultitabWebSpider:
 
         except Exception as e:
             logger.error(f"获取页面内容失败 {url}: {e}")
+            if self.driver:
+                self.driver.quit()
+                logger.info("浏览器已关闭")
             return {
                 'url': url,
                 'source_code': '',
@@ -494,7 +508,11 @@ class MultitabWebSpider:
                                 self.driver.execute_script('window.stop && window.stop();')
                             except Exception:
                                 pass
-                        source_code = self.driver.page_source
+                        try:
+                            source_code = self.driver.execute_script("return document.documentElement.outerHTML;") or ""
+                        except Exception as e:
+                            logger.warning(f"获取源码失败 (JS): {u}, error: {e}")
+                            source_code = ""
                         status_code = self._get_status_code(u)
                         results_by_index[idx] = {
                             'url': u,
@@ -573,7 +591,66 @@ class MultitabWebSpider:
             logger.debug(f"切换到主标签页失败: {e}")
 
 
-def _fetch_single_url_with_fresh_driver(url: str, headless: bool = True, timeout: int = 30) -> Dict:
+def get_html_source_for_flask(url: str, headless: bool = False) -> Dict:
+    """
+    获取单个URL的HTML源码，为Flask单次调用设计。
+
+    :param url: 目标URL
+    :param headless: 是否使用无头模式
+    :return: 包含源码和状态的字典
+    """
+    try:
+        logger.info(f"PID={os.getpid()} [Flask Call] 启动浏览器抓取 -> {url}")
+        with MultitabWebSpider(headless=headless, timeout=30) as spider:
+            base_handle = spider.driver.current_window_handle
+            result = spider._get_page_content(url, base_handle)
+            logger.info(f"PID={os.getpid()} [Flask Call] 完成抓取 <- {url} len={result.get('content_length', 0)}")
+            return result
+    except Exception as e:
+        logger.error(f"[Flask Call] 抓取失败 {url}: {e}")
+        return {
+            'url': url,
+            'source_code': '',
+            'status': 'failed',
+            'status_code': 0,
+            'error': str(e),
+            'content_length': 0
+        }
+
+
+def prewarm_uc_driver(
+    headless: bool = False,
+    check_prewarmed_env: bool = True
+) -> None:
+    """
+    预热 undetected-chromedriver，避免首次并发调用时产生驱动下载/解压的竞态。
+    同时，将实际使用的 chromedriver 路径写入环境变量，供后续进程复用。
+
+    :param headless: 预热时是否使用无头模式
+    :param check_prewarmed_env: 是否检查环境变量，若已预热则跳过
+    """
+    if check_prewarmed_env and os.environ.get('UC_PREWARMED') == '1':
+        logger.info("驱动已预热，跳过。")
+        return
+
+    logger.info("开始预热 UC 驱动...")
+    try:
+        with MultitabWebSpider(headless=headless, timeout=10) as warmup:
+            try:
+                cd_path = getattr(getattr(warmup.driver, 'service', None), 'path', None)
+                if cd_path and os.path.exists(cd_path):
+                    os.environ['UC_DRIVER_EXECUTABLE'] = cd_path
+                    logger.info(f"驱动路径已设置: {cd_path}")
+                os.environ['UC_PREWARMED'] = '1'
+                logger.info("驱动预热成功。")
+            except Exception as e:
+                os.environ['UC_PREWARMED'] = '1'  # 即使路径获取失败，也标记为已尝试
+                logger.warning(f"预热期间获取驱动路径失败（但仍标记为已预热）: {e}")
+    except Exception as e:
+        logger.error(f"驱动预热失败: {e}")
+
+
+def _fetch_single_url_with_fresh_driver(url: str, headless: bool = False, timeout: int = 30) -> Dict:
     """
     在独立浏览器会话中抓取单个 URL。
     注意：该函数会在内部创建并销毁一个浏览器实例，适合在线程/进程池中调用。
@@ -598,10 +675,10 @@ def _fetch_single_url_with_fresh_driver(url: str, headless: bool = True, timeout
 
 
 def get_html_sources(urls: Union[str, List[str]],
-                     headless: bool = True,
-                     num_workers: int = 4,
-                     timeout: int = 30,
-                     save_to_file: str = None) -> Union[Dict, List[Dict]]:
+                                  headless: bool = False,
+                                  num_workers: int = 4,
+                                  timeout: int = 30,
+                                  save_to_file: str = None) -> Union[Dict, List[Dict]]:
     """
     多进程并发版：每个进程独立启动一个浏览器抓取，隔离性最佳。
     注意：macOS 默认使用 spawn，需要确保在 __main__ 保护下调用。
